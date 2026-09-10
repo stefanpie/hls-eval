@@ -43,7 +43,7 @@ def load_kernel_maes(
         for sample in model_results:
             kernel_name = sample["benchmark_case_name"]
             estimated_cycles = sample.get("estimated_latency_cycles")
-            actual_cycles = sample.get("target_actual_latency_cycles")
+            actual_cycles = sample.get("target_actual_latency_cycles__cosim")
 
             if estimated_cycles is None or actual_cycles is None:
                 continue
@@ -276,7 +276,7 @@ def load_kernel_sample_ratios(
         sample_ratios = []
         for _, sample in samples:
             estimated_cycles = sample.get("estimated_latency_cycles")
-            actual_cycles = sample.get("target_actual_latency_cycles")
+            actual_cycles = sample.get("target_actual_latency_cycles__cosim")
             if (
                 estimated_cycles is None
                 or actual_cycles is None

@@ -54,7 +54,7 @@ def load_kernel_rankings(
             continue
 
         kernel_name = model_results[0]["benchmark_case_name"]
-        true_latency = model_results[0].get("target_actual_latency_cycles")
+        true_latency = model_results[0].get("target_actual_latency_cycles__cosim")
         estimated_latencies = [
             sample["estimated_latency_cycles"]
             for sample in model_results

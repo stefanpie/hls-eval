@@ -11,7 +11,7 @@ from pathlib import Path
 import psutil
 
 from hls_eval.data import H_EXTENSIONS
-from hls_eval.vhls_report import DesignHLSSynthData
+from hls_eval.vhls_report import DesignHLSCoSimData, DesignHLSSynthData
 
 
 def _compiler_defines_to_cflags(compiler_defines: list[str]) -> str:
@@ -187,13 +187,14 @@ class VitisHLSSynthTool:
             text=True,
         )
         try:
-            p.wait(timeout=timeout)
+            stdout, stderr = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process_id = psutil.Process(pid=p.pid)
             children = process_id.children(recursive=True)
             for child in children:
                 child.terminate()
             p.terminate()
+            p.communicate()
 
             return ToolDataOutput(
                 data_execution=ExecutionData(
@@ -212,12 +213,6 @@ class VitisHLSSynthTool:
         dt: float = t_1 - t_0
 
         if p.returncode != 0:
-            assert p.stdout is not None
-            assert p.stderr is not None
-            # assert isinstance(p.stdout, str)
-            # assert isinstance(p.stderr, str)
-            stdout = p.stdout.read()
-            stderr = p.stderr.read()
             return ToolDataOutput(
                 data_execution=ExecutionData(
                     return_code=p.returncode,
@@ -236,12 +231,6 @@ class VitisHLSSynthTool:
         csynth_rpt_fp = report_dir / "csynth.xml"
 
         synthesis_data = DesignHLSSynthData.parse_from_synth_report_file(csynth_rpt_fp)
-
-        assert p.stdout is not None
-        assert p.stderr is not None
-
-        stdout = p.stdout.read()
-        stderr = p.stderr.read()
 
         return ToolDataOutput(
             data_execution=ExecutionData(
@@ -324,13 +313,14 @@ class VitisHLSCSimTool:
             text=True,
         )
         try:
-            p_compile.wait(timeout=timeout)
+            compile_stdout, compile_stderr = p_compile.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process_id = psutil.Process(pid=p_compile.pid)
             children = process_id.children(recursive=True)
             for child in children:
                 child.terminate()
             p_compile.terminate()
+            p_compile.communicate()
 
             return ToolDataOutput(
                 data_execution=ExecutionData(
@@ -348,14 +338,11 @@ class VitisHLSCSimTool:
         t_1 = time.monotonic()
         dt: float = t_1 - t_0
 
-        assert p_compile.stdout is not None
-        assert p_compile.stderr is not None
-
         compile_data = ToolDataOutput(
             data_execution=ExecutionData(
                 return_code=p_compile.returncode,
-                stdout=p_compile.stdout.read(),
-                stderr=p_compile.stderr.read(),
+                stdout=compile_stdout,
+                stderr=compile_stderr,
                 t0=t_0,
                 t1=t_1,
                 execution_time=dt,
@@ -386,13 +373,14 @@ class VitisHLSCSimTool:
         )
 
         try:
-            p_run.wait(timeout=timeout)
+            run_stdout, run_stderr = p_run.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process_id = psutil.Process(pid=p_run.pid)
             children = process_id.children(recursive=True)
             for child in children:
                 child.terminate()
             p_run.terminate()
+            p_run.communicate()
 
             return compile_data, ToolDataOutput(
                 data_execution=ExecutionData(
@@ -410,14 +398,11 @@ class VitisHLSCSimTool:
         t_1 = time.monotonic()
         dt = t_1 - t_0
 
-        assert p_run.stdout is not None
-        assert p_run.stderr is not None
-
         run_data = ToolDataOutput(
             data_execution=ExecutionData(
                 return_code=p_run.returncode,
-                stdout=p_run.stdout.read(),
-                stderr=p_run.stderr.read(),
+                stdout=run_stdout,
+                stderr=run_stderr,
                 t0=t_0,
                 t1=t_1,
                 execution_time=dt,
@@ -503,13 +488,14 @@ class VitisHLSCoSimTool:
             text=True,
         )
         try:
-            p.wait(timeout=timeout)
+            stdout, stderr = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process_id = psutil.Process(pid=p.pid)
             children = process_id.children(recursive=True)
             for child in children:
                 child.terminate()
             p.terminate()
+            p.communicate()
 
             return ToolDataOutput(
                 data_execution=ExecutionData(
@@ -528,12 +514,6 @@ class VitisHLSCoSimTool:
         dt: float = t_1 - t_0
 
         if p.returncode != 0:
-            assert p.stdout is not None
-            assert p.stderr is not None
-            # assert isinstance(p.stdout, str)
-            # assert isinstance(p.stderr, str)
-            stdout = p.stdout.read()
-            stderr = p.stderr.read()
             return ToolDataOutput(
                 data_execution=ExecutionData(
                     return_code=p.returncode,
@@ -548,42 +528,19 @@ class VitisHLSCoSimTool:
             )
 
         solution_dir = unique_build_dir / f"{build_name}__proj/solution__synth"
+
         report_dir: Path = solution_dir / "syn" / "report"
         csynth_rpt_fp = report_dir / "csynth.xml"
         synthesis_data = DesignHLSSynthData.parse_from_synth_report_file(csynth_rpt_fp)
 
         cosim_report_dir = solution_dir / "sim" / "report" / "verilog"
         lat_rpt_fp = cosim_report_dir / "lat.rpt"
-
-        def parse_cosim_report(txt: str) -> dict[str, int]:
-            data = {}
-            for line in txt.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if not line.startswith("$"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip().removeprefix("$").lower()
-                value = value.strip().strip('"')
-                value_int = int(value)
-                data[key] = value_int
-            return data
-
-        cosim_data = parse_cosim_report(lat_rpt_fp.read_text())
+        cosim_data = DesignHLSCoSimData.parse_from_synth_report_file(lat_rpt_fp)
 
         data_tool_combined = {
             "data_synthesis": synthesis_data.to_dict(),
-            "data_cosim": cosim_data,
+            "data_cosim": cosim_data.to_dict(),
         }
-
-        assert p.stdout is not None
-        assert p.stderr is not None
-
-        stdout = p.stdout.read()
-        stderr = p.stderr.read()
 
         return ToolDataOutput(
             data_execution=ExecutionData(

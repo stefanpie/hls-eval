@@ -16,7 +16,7 @@ from hls_eval.llms import Model, TAIPromptTooLong, TAITimeout, normalize_model_n
 from hls_eval.prompting import approx_num_tokens, extract_code_xml_from_llm_output
 from hls_eval.prompts import build_prompt_edit_zero_shot, build_prompt_gen_zero_shot
 
-from hls_eval.tools import VitisHLSCSimTool, VitisHLSSynthTool
+from hls_eval.tools import VitisHLSCoSimTool, VitisHLSCSimTool, VitisHLSSynthTool
 
 
 class EvalThreadPools:
@@ -68,7 +68,7 @@ class Evaluator(ABC):
     def __init__(
         self,
         vitis_hls_tool_csim: VitisHLSCSimTool,
-        vitis_hls_tool_synth: VitisHLSSynthTool,
+        vitis_hls_tool_synth: VitisHLSSynthTool | VitisHLSCoSimTool,
         output_data_dir: Path,
     ) -> None:
         self.cpp_compiler_tool = vitis_hls_tool_csim

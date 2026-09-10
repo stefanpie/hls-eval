@@ -4,10 +4,12 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
 
+from joblib import Parallel, delayed
 from llm import Response
 
 from hls_eval.data import BenchmarkCase
@@ -23,7 +25,7 @@ from hls_eval.prompting import (
     build_input_code_prompt_xml,
     extract_code_xml_from_llm_output,
 )
-from hls_eval.tools import VitisHLSCSimTool, VitisHLSSynthTool
+from hls_eval.tools import ToolDataOutput, VitisHLSCoSimTool, VitisHLSCSimTool
 
 
 SAFE_STDLIB_MODULES = {
@@ -271,7 +273,7 @@ class HLSKernelRuntimeZeroShotEvaluator(Evaluator):
     def __init__(
         self,
         vitis_hls_tool_csim: VitisHLSCSimTool,
-        vitis_hls_tool_synth: VitisHLSSynthTool,
+        vitis_hls_tool_cosim: VitisHLSCoSimTool,
         output_data_dir: Path,
         n_samples: int = 1,
         temperature: float | None = None,
@@ -298,7 +300,7 @@ class HLSKernelRuntimeZeroShotEvaluator(Evaluator):
         self.hls_unsafe_math = hls_unsafe_math
         self.estimator_timeout_seconds = estimator_timeout_seconds
 
-        super().__init__(vitis_hls_tool_csim, vitis_hls_tool_synth, output_data_dir)
+        super().__init__(vitis_hls_tool_csim, vitis_hls_tool_cosim, output_data_dir)
 
     def evaluate_design(
         self,
@@ -329,6 +331,7 @@ class HLSKernelRuntimeZeroShotEvaluator(Evaluator):
             self.vitis_hls_tool.run,
             ground_truth_build_dir,
             synthesis_source_files,
+            aux_files=[benchmark_case.tb_file],
             build_name=eval_id,
             hls_top_function=benchmark_case.top_fn,
             hls_fpga_part=self.hls_fpga_part,
@@ -338,142 +341,21 @@ class HLSKernelRuntimeZeroShotEvaluator(Evaluator):
             hls_compiler_defines=self.hls_compiler_defines,
         )
 
-        for sample_idx in range(self.n_samples):
-            eval_data: dict[str, Any] = {
-                "eval_type": "hls_kernel_runtime_zero_shot",
-                "eval_id": eval_id,
-                "benchmark_case_name": benchmark_case_name,
-                "benchmark_case_tags": benchmark_case.tags_all,
-                "model_name": model_name,
-                "model_name_normalized": model_name_normalized,
-                "temperature": self.temperature,
-                "n_samples": self.n_samples,
-                "estimated_latency_cycles": None,
-                "synthesis_parameters": {
-                    "hls_clock_period_ns": self.hls_clock_period_ns,
-                    "hls_clock_frequency_mhz": 1000.0 / self.hls_clock_period_ns,
-                    "hls_fpga_part": self.hls_fpga_part,
-                    "hls_compiler_defines": self.hls_compiler_defines,
-                    "hls_top_function": benchmark_case.top_fn,
-                    "hls_disable_auto_optimizations": (
-                        self.hls_disable_auto_optimizations
-                    ),
-                    "hls_unsafe_math": self.hls_unsafe_math,
-                },
-            }
-            eval_dir = eval_dir_top / f"sample__{sample_idx}"
-            eval_dir.mkdir(parents=True)
-
-            design_dir = eval_dir / "design"
-            sample_benchmark_case = benchmark_case.copy_to(design_dir)
-            prompt = _build_runtime_estimation_prompt(
-                sample_benchmark_case,
-                self.hls_clock_period_ns,
-                self.hls_fpga_part,
-                self.hls_compiler_defines,
-                self.hls_disable_auto_optimizations,
-                self.hls_unsafe_math,
+        Parallel(n_jobs=self.n_samples, backend="threading")(
+            delayed(self._evaluate_sample)(
+                sample_idx=sample_idx,
+                benchmark_case=benchmark_case,
+                model=model,
+                pools=pools,
+                eval_id=eval_id,
+                benchmark_case_name=benchmark_case_name,
+                model_name=model_name,
+                model_name_normalized=model_name_normalized,
+                eval_dir_top=eval_dir_top,
+                synthesis_future=synthesis_future,
             )
-            eval_data["prompt"] = prompt
-            (eval_dir / "raw_llm_prompt.txt").write_text(prompt)
-
-            llm = model.llm
-
-            def call_model() -> tuple[
-                Response | None, str | None, bool, bool, float, float
-            ]:
-                t0 = time.monotonic()
-                try:
-                    response = llm.prompt(
-                        prompt=prompt,
-                        stream=False,
-                        temperature=self.temperature,
-                    )
-                    response._force()
-                    response_text = response.text()
-                    return (
-                        response,
-                        response_text,
-                        False,
-                        False,
-                        t0,
-                        time.monotonic(),
-                    )
-                except TAITimeout:
-                    return None, None, True, False, t0, time.monotonic()
-                except TAIPromptTooLong:
-                    return None, None, False, True, t0, time.monotonic()
-
-            self.logger.info(
-                f"[{eval_id}] Calling model with approximately "
-                f"{approx_num_tokens(prompt)} prompt tokens"
-            )
-            llm_future = pools.pool_llm.submit(call_model)
-            (
-                response,
-                response_text,
-                model_timeout,
-                prompt_too_long,
-                llm_t0,
-                llm_t1,
-            ) = llm_future.result()
-            eval_data["model_timeout"] = model_timeout
-            eval_data["prompt_too_long"] = prompt_too_long
-            eval_data["llm_execution_time"] = {
-                "t0": llm_t0,
-                "t1": llm_t1,
-                "execution_time": llm_t1 - llm_t0,
-            }
-
-            if response is not None and response_text is not None:
-                if response.response_json is not None:
-                    eval_data["response_json"] = response.response_json
-                eval_data["raw_output"] = response_text
-                (eval_dir / "raw_llm_output.txt").write_text(response_text)
-
-                try:
-                    generated_code = extract_code_xml_from_llm_output(response_text)
-                    if set(generated_code) != {"estimate.py"}:
-                        raise ValueError(
-                            "Expected exactly one OUTPUT_CODE named estimate.py"
-                        )
-                    estimator_code = generated_code["estimate.py"].strip() + "\n"
-                    eval_data["generated_code"] = {"estimate.py": estimator_code}
-                    _validate_estimator_script(estimator_code)
-                    estimator_script_path = eval_dir / "estimate.py"
-                    estimator_script_path.write_text(estimator_code)
-                    (
-                        estimated_cycles,
-                        execution_data,
-                        estimator_error,
-                    ) = _run_estimator_script(
-                        estimator_script_path,
-                        self.estimator_timeout_seconds,
-                    )
-                    eval_data["estimator_execution"] = execution_data
-                    if estimator_error is None:
-                        eval_data["can_parse_output"] = True
-                        eval_data["estimated_latency_cycles"] = estimated_cycles
-                    else:
-                        eval_data["can_parse_output"] = False
-                        eval_data["estimator_error"] = estimator_error
-                except (SyntaxError, ValueError) as error:
-                    eval_data["can_parse_output"] = False
-                    eval_data["estimator_error"] = str(error)
-
-            synthesis_output = synthesis_future.result()
-            eval_data["vitis_hls_tool_out"] = _serialize_tool_output(synthesis_output)
-            if synthesis_output.data_tool:
-                eval_data["actual_latency_cycles"] = {
-                    "best": synthesis_output.data_tool.get("latency_best_cycles"),
-                    "average": synthesis_output.data_tool.get("latency_average_cycles"),
-                    "worst": synthesis_output.data_tool.get("latency_worst_cycles"),
-                }
-                eval_data["target_actual_latency_cycles"] = (
-                    synthesis_output.data_tool.get("latency_worst_cycles")
-                )
-
-            serialize_eval_data(eval_id, eval_dir, eval_data)
+            for sample_idx in range(self.n_samples)
+        )
 
         all_eval_data = {}
         for sample_idx in range(self.n_samples):
@@ -484,3 +366,160 @@ class HLSKernelRuntimeZeroShotEvaluator(Evaluator):
         (eval_dir_top / "all_eval_data.json").write_text(
             json.dumps(all_eval_data, indent=4)
         )
+
+    def _evaluate_sample(
+        self,
+        sample_idx: int,
+        benchmark_case: BenchmarkCase,
+        model: Model,
+        pools: EvalThreadPools,
+        eval_id: str,
+        benchmark_case_name: str,
+        model_name: str,
+        model_name_normalized: str,
+        eval_dir_top: Path,
+        synthesis_future: "Future[ToolDataOutput]",
+    ) -> None:
+        eval_data: dict[str, Any] = {
+            "eval_type": "hls_kernel_runtime_zero_shot",
+            "eval_id": eval_id,
+            "benchmark_case_name": benchmark_case_name,
+            "benchmark_case_tags": benchmark_case.tags_all,
+            "model_name": model_name,
+            "model_name_normalized": model_name_normalized,
+            "temperature": self.temperature,
+            "n_samples": self.n_samples,
+            "estimated_latency_cycles": None,
+            "synthesis_parameters": {
+                "hls_clock_period_ns": self.hls_clock_period_ns,
+                "hls_clock_frequency_mhz": 1000.0 / self.hls_clock_period_ns,
+                "hls_fpga_part": self.hls_fpga_part,
+                "hls_compiler_defines": self.hls_compiler_defines,
+                "hls_top_function": benchmark_case.top_fn,
+                "hls_disable_auto_optimizations": (
+                    self.hls_disable_auto_optimizations
+                ),
+                "hls_unsafe_math": self.hls_unsafe_math,
+            },
+        }
+        eval_dir = eval_dir_top / f"sample__{sample_idx}"
+        eval_dir.mkdir(parents=True)
+
+        design_dir = eval_dir / "design"
+        sample_benchmark_case = benchmark_case.copy_to(design_dir)
+        prompt = _build_runtime_estimation_prompt(
+            sample_benchmark_case,
+            self.hls_clock_period_ns,
+            self.hls_fpga_part,
+            self.hls_compiler_defines,
+            self.hls_disable_auto_optimizations,
+            self.hls_unsafe_math,
+        )
+        eval_data["prompt"] = prompt
+        (eval_dir / "raw_llm_prompt.txt").write_text(prompt)
+
+        llm = model.llm
+
+        def call_model() -> tuple[Response | None, str | None, bool, bool, float, float]:
+            t0 = time.monotonic()
+            try:
+                response = llm.prompt(
+                    prompt=prompt,
+                    stream=False,
+                    temperature=self.temperature,
+                )
+                response._force()
+                response_text = response.text()
+                return (
+                    response,
+                    response_text,
+                    False,
+                    False,
+                    t0,
+                    time.monotonic(),
+                )
+            except TAITimeout:
+                return None, None, True, False, t0, time.monotonic()
+            except TAIPromptTooLong:
+                return None, None, False, True, t0, time.monotonic()
+
+        self.logger.info(
+            f"[{eval_id}] Calling model with approximately "
+            f"{approx_num_tokens(prompt)} prompt tokens"
+        )
+        llm_future = pools.pool_llm.submit(call_model)
+        (
+            response,
+            response_text,
+            model_timeout,
+            prompt_too_long,
+            llm_t0,
+            llm_t1,
+        ) = llm_future.result()
+        eval_data["model_timeout"] = model_timeout
+        eval_data["prompt_too_long"] = prompt_too_long
+        eval_data["llm_execution_time"] = {
+            "t0": llm_t0,
+            "t1": llm_t1,
+            "execution_time": llm_t1 - llm_t0,
+        }
+
+        if response is not None and response_text is not None:
+            if response.response_json is not None:
+                eval_data["response_json"] = response.response_json
+            eval_data["raw_output"] = response_text
+            (eval_dir / "raw_llm_output.txt").write_text(response_text)
+
+            try:
+                generated_code = extract_code_xml_from_llm_output(response_text)
+                if set(generated_code) != {"estimate.py"}:
+                    raise ValueError(
+                        "Expected exactly one OUTPUT_CODE named estimate.py"
+                    )
+                estimator_code = generated_code["estimate.py"].strip() + "\n"
+                eval_data["generated_code"] = {"estimate.py": estimator_code}
+                _validate_estimator_script(estimator_code)
+                estimator_script_path = eval_dir / "estimate.py"
+                estimator_script_path.write_text(estimator_code)
+                (
+                    estimated_cycles,
+                    execution_data,
+                    estimator_error,
+                ) = _run_estimator_script(
+                    estimator_script_path,
+                    self.estimator_timeout_seconds,
+                )
+                eval_data["estimator_execution"] = execution_data
+                if estimator_error is None:
+                    eval_data["can_parse_output"] = True
+                    eval_data["estimated_latency_cycles"] = estimated_cycles
+                else:
+                    eval_data["can_parse_output"] = False
+                    eval_data["estimator_error"] = estimator_error
+            except (SyntaxError, ValueError) as error:
+                eval_data["can_parse_output"] = False
+                eval_data["estimator_error"] = str(error)
+
+        cosim_output = synthesis_future.result()
+        eval_data["vitis_hls_tool_out"] = _serialize_tool_output(cosim_output)
+        if cosim_output.data_tool:
+            data_synthesis = cosim_output.data_tool.get("data_synthesis") or {}
+            data_cosim = cosim_output.data_tool.get("data_cosim") or {}
+            eval_data["actual_latency_cycles__synth"] = {
+                "best": data_synthesis.get("latency_best_cycles"),
+                "average": data_synthesis.get("latency_average_cycles"),
+                "worst": data_synthesis.get("latency_worst_cycles"),
+            }
+            eval_data["actual_latency_cycles__cosim"] = {
+                "best": data_cosim.get("min_latency"),
+                "average": data_cosim.get("average_latency"),
+                "worst": data_cosim.get("max_latency"),
+            }
+            eval_data["target_actual_latency_cycles__synth"] = data_synthesis.get(
+                "latency_worst_cycles"
+            )
+            eval_data["target_actual_latency_cycles__cosim"] = data_cosim.get(
+                "max_latency"
+            )
+
+        serialize_eval_data(eval_id, eval_dir, eval_data)

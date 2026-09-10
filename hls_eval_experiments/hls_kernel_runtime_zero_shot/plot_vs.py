@@ -17,6 +17,7 @@ DEFAULT_OUTPUT_DATA_DIR = DIR_CURRENT / "output_data"
 DEFAULT_PLOT_PATH = DIR_FIGURES / "kernel_latency_vs.png"
 DEFAULT_MAE_HIST_PLOT_PATH = DIR_FIGURES / "kernel_latency_mae_hist.png"
 DEFAULT_RESIDUAL_PLOT_PATH = DIR_FIGURES / "kernel_latency_residuals.png"
+DEFAULT_ABS_ERROR_VS_TRUE_PLOT_PATH = DIR_FIGURES / "kernel_latency_abs_error_vs_true.png"
 
 MODELS_TO_PLOT = ["deepseek/deepseek-v4-flash", "openai/gpt-oss-120b"]
 
@@ -37,7 +38,7 @@ def load_true_vs_predicted(
 
         for sample in model_results:
             estimated_cycles = sample.get("estimated_latency_cycles")
-            actual_cycles = sample.get("target_actual_latency_cycles")
+            actual_cycles = sample.get("target_actual_latency_cycles__cosim")
 
             if estimated_cycles is None or actual_cycles is None:
                 continue
@@ -68,7 +69,7 @@ def load_kernel_median_true_vs_predicted(
         if not model_results:
             continue
 
-        true_latency = model_results[0].get("target_actual_latency_cycles")
+        true_latency = model_results[0].get("target_actual_latency_cycles__cosim")
         estimated_latencies = [
             sample["estimated_latency_cycles"]
             for sample in model_results
@@ -245,6 +246,64 @@ def plot_residuals(
     plt.close(figure)
 
 
+def plot_absolute_error_vs_true(
+    true_vs_predicted: list[tuple[float, float]],
+    plot_path: Path,
+    model_name: str,
+    kernel_median_true_vs_predicted: list[tuple[float, float]] | None = None,
+) -> None:
+    if not true_vs_predicted:
+        raise ValueError("No valid model results were found")
+
+    true_values = [true for true, _ in true_vs_predicted]
+    absolute_errors = [abs(predicted - true) for true, predicted in true_vs_predicted]
+
+    figure, axis = plt.subplots(figsize=(7, 5))
+
+    axis.scatter(
+        true_values,
+        absolute_errors,
+        s=36,
+        facecolor=(0.122, 0.467, 0.706, 0.5),
+        edgecolor="tab:blue",
+        linewidth=0.5,
+        zorder=2,
+    )
+
+    all_absolute_errors = list(absolute_errors)
+    if kernel_median_true_vs_predicted:
+        median_true_values = [true for true, _ in kernel_median_true_vs_predicted]
+        median_absolute_errors = [
+            abs(predicted - true) for true, predicted in kernel_median_true_vs_predicted
+        ]
+        all_absolute_errors += median_absolute_errors
+
+        axis.scatter(
+            median_true_values,
+            median_absolute_errors,
+            s=22,
+            marker="x",
+            color=(0.8, 0.0, 0.0, 0.4),
+            linewidth=1.2,
+            label="Per-kernel median",
+            zorder=3,
+        )
+        axis.legend(loc="upper left", fontsize=8, framealpha=0.85)
+
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+
+    axis.set_title(f"HLS Kernel Latency Absolute Error vs. True Latency - {model_name}")
+    axis.set_xlabel("True Latency (Clock Cycles, Log Scale)")
+    axis.set_ylabel("Absolute Error: |Predicted − True| (Clock Cycles, Log Scale)")
+    axis.grid(linestyle="--", alpha=0.35)
+    axis.set_axisbelow(True)
+
+    figure.tight_layout()
+    figure.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
 def load_absolute_errors(
     output_data_dir: Path,
     model_name: str,
@@ -261,7 +320,7 @@ def load_absolute_errors(
 
         for sample in model_results:
             estimated_cycles = sample.get("estimated_latency_cycles")
-            actual_cycles = sample.get("target_actual_latency_cycles")
+            actual_cycles = sample.get("target_actual_latency_cycles__cosim")
 
             if estimated_cycles is None or actual_cycles is None:
                 continue
@@ -338,11 +397,18 @@ def main() -> None:
         default=DEFAULT_RESIDUAL_PLOT_PATH,
         help="Path for the generated residual (signed error vs. true latency) PNG plot",
     )
+    parser.add_argument(
+        "--abs-error-vs-true-output",
+        type=Path,
+        default=DEFAULT_ABS_ERROR_VS_TRUE_PLOT_PATH,
+        help="Path for the generated absolute error vs. true latency PNG plot",
+    )
     args = parser.parse_args()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.mae_hist_output.parent.mkdir(parents=True, exist_ok=True)
     args.residual_output.parent.mkdir(parents=True, exist_ok=True)
+    args.abs_error_vs_true_output.parent.mkdir(parents=True, exist_ok=True)
 
     for model_name in MODELS_TO_PLOT:
         plot_path = model_plot_path(args.output, model_name)
@@ -354,6 +420,17 @@ def main() -> None:
             residual_plot_path = model_plot_path(args.residual_output, model_name)
             plot_residuals(true_vs_predicted, residual_plot_path, model_name)
             print(f"Saved {model_name} residual plot to {residual_plot_path}")
+
+            abs_error_vs_true_plot_path = model_plot_path(
+                args.abs_error_vs_true_output, model_name
+            )
+            plot_absolute_error_vs_true(
+                true_vs_predicted, abs_error_vs_true_plot_path, model_name
+            )
+            print(
+                f"Saved {model_name} absolute error vs. true latency plot to "
+                f"{abs_error_vs_true_plot_path}"
+            )
         else:
             print(f"Skipping {model_name} plot: no valid model results")
 

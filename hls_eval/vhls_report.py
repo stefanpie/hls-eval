@@ -189,3 +189,69 @@ class DesignHLSSynthData:
     @classmethod
     def from_dict(cls, d: dict) -> "DesignHLSSynthData":
         return cls(**d)
+
+
+@dataclass
+class DesignHLSCoSimData:
+    # $MAX_LATENCY = "100866"
+    # $MIN_LATENCY = "100866"
+    # $AVER_LATENCY = "100866"
+    # $MAX_THROUGHPUT = "0"
+    # $MIN_THROUGHPUT = "0"
+    # $AVER_THROUGHPUT = "0"
+    # $TOTAL_EXECUTE_TIME = "100866"
+
+    max_latency: int
+    min_latency: int
+    average_latency: int
+
+    max_throughput: int
+    min_throughput: int
+    average_throughput: int
+
+    total_execute_time: int
+
+    @classmethod
+    def parse_from_synth_report_file(cls, fp: Path) -> "DesignHLSCoSimData":
+        txt = fp.read_text()
+        data = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("$"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().removeprefix("$").lower()
+            value = value.strip().strip('"')
+            value_int = int(value)
+            data[key] = value_int
+
+        max_latency = unwrap(data.get("max_latency"))
+        min_latency = unwrap(data.get("min_latency"))
+        average_latency = unwrap(data.get("aver_latency"))
+
+        max_throughput = unwrap(data.get("max_throughput"))
+        min_throughput = unwrap(data.get("min_throughput"))
+        average_throughput = unwrap(data.get("aver_throughput"))
+
+        total_execute_time = unwrap(data.get("total_execute_time"))
+
+        return cls(
+            max_latency=max_latency,
+            min_latency=min_latency,
+            average_latency=average_latency,
+            max_throughput=max_throughput,
+            min_throughput=min_throughput,
+            average_throughput=average_throughput,
+            total_execute_time=total_execute_time,
+        )
+
+    def to_dict(self) -> dict:
+        return self.__dict__
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DesignHLSCoSimData":
+        return cls(**d)

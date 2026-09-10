@@ -1,6 +1,5 @@
 import argparse
 import json
-import random
 import statistics
 from pathlib import Path
 
@@ -9,7 +8,9 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from scipy.stats import kendalltau, spearmanr
+import numpy as np
+from matplotlib.ticker import FixedLocator, LogLocator, NullFormatter, ScalarFormatter
+from scipy.stats import rankdata
 
 DIR_CURRENT = Path(__file__).resolve().parent
 DIR_FIGURES = DIR_CURRENT / "figures"
@@ -27,7 +28,7 @@ MODELS_TO_PLOT = ["deepseek/deepseek-v4-flash", "openai/gpt-oss-120b"]
 # trials at k=1. This is cheap CPU-only resampling of already-collected LLM
 # estimates (no new LLM calls), so we use a generous fixed trial count well
 # above that minimum rather than tuning it per k.
-MONTE_CARLO_TRIALS = 2000
+MONTE_CARLO_TRIALS = 10_000
 
 AGGREGATORS = {
     "median": statistics.median,
@@ -57,7 +58,7 @@ def load_kernel_samples(
             continue
 
         kernel_name = model_results[0]["benchmark_case_name"]
-        true_latency = model_results[0].get("target_actual_latency_cycles")
+        true_latency = model_results[0].get("target_actual_latency_cycles__cosim")
         estimated_latencies = [
             sample["estimated_latency_cycles"]
             for sample in model_results
@@ -72,20 +73,102 @@ def load_kernel_samples(
     return kernels
 
 
-def draw_k_samples(
-    estimates: list[float], k: int, rng: random.Random
-) -> list[float]:
-    """Draw k samples for one kernel, matching pass@k-style resampling.
+def draw_k_samples_batch(
+    estimates: list[float], k: int, n_trials: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Draw k samples for one kernel, independently for each of n_trials trials.
 
-    Sampled without replacement when the kernel has at least k valid
-    estimates (an ordinary random subset, as in pass@k). When a kernel has
-    fewer than k valid estimates, without-replacement sampling of k values is
+    Returns an (n_trials, k) array. Sampled without replacement when the
+    kernel has at least k valid estimates (an ordinary random subset, as in
+    pass@k): each trial row is obtained by independently shuffling the full
+    estimate array and keeping the first k entries. When a kernel has fewer
+    than k valid estimates, without-replacement sampling of k values is
     impossible, so we fall back to sampling with replacement from whatever
     valid estimates that kernel does have.
     """
-    if len(estimates) >= k:
-        return rng.sample(estimates, k)
-    return [rng.choice(estimates) for _ in range(k)]
+    estimates_arr = np.asarray(estimates, dtype=float)
+    n = estimates_arr.shape[0]
+
+    if n >= k:
+        # Independently permute each trial row, then take the first k
+        # columns: equivalent to without-replacement sampling per trial.
+        row_permutations = np.argsort(rng.random((n_trials, n)), axis=1)
+        selected_indices = row_permutations[:, :k]
+    else:
+        selected_indices = rng.integers(0, n, size=(n_trials, k))
+
+    return estimates_arr[selected_indices]
+
+
+def aggregate_batch(samples: np.ndarray, aggregator_name: str) -> np.ndarray:
+    """Aggregate an (n_trials, k) sample array to (n_trials,) along axis=1."""
+    if aggregator_name == "median":
+        return np.median(samples, axis=1)
+    if aggregator_name == "mean":
+        return np.mean(samples, axis=1)
+    raise ValueError(f"Unknown aggregator: {aggregator_name}")
+
+
+def spearman_rho_batch(true_values: np.ndarray, predicted_batch: np.ndarray) -> np.ndarray:
+    """Vectorized Spearman rho for each trial (row) in predicted_batch.
+
+    true_values: (n_kernels,) fixed gold values, shared across all trials.
+    predicted_batch: (n_trials, n_kernels) predicted values, one row/trial.
+    Returns (n_trials,) rho values, matching scipy.stats.spearmanr (which
+    ranks with average-rank tie handling, then takes the Pearson correlation
+    of the ranks).
+    """
+    true_ranks = rankdata(true_values)
+    predicted_ranks = rankdata(predicted_batch, axis=1)
+
+    true_centered = true_ranks - true_ranks.mean()
+    predicted_centered = predicted_ranks - predicted_ranks.mean(axis=1, keepdims=True)
+
+    numerator = predicted_centered @ true_centered
+    denominator = np.sqrt(
+        (predicted_centered**2).sum(axis=1) * (true_centered**2).sum()
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(denominator != 0, numerator / denominator, np.nan)
+
+
+def kendall_tau_b_batch(true_values: np.ndarray, predicted_batch: np.ndarray) -> np.ndarray:
+    """Vectorized Kendall tau-b for each trial (row) in predicted_batch.
+
+    Matches scipy.stats.kendalltau's default variant="b": pairwise
+    concordant/discordant counts normalized by the geometric mean of
+    (total pairs minus tied pairs) on each side, which reduces to the
+    ordinary tau-a formula when there are no ties.
+    """
+    n_trials, n = predicted_batch.shape
+
+    true_diff = true_values[:, None] - true_values[None, :]
+    true_sign = np.sign(true_diff)
+
+    predicted_diff = predicted_batch[:, :, None] - predicted_batch[:, None, :]
+    predicted_sign = np.sign(predicted_diff)
+
+    # Only count each unordered pair once (upper triangle, i < j).
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    true_sign_pairs = true_sign[triu_i, triu_j]
+    predicted_sign_pairs = predicted_sign[:, triu_i, triu_j]
+
+    concordant_minus_discordant = (predicted_sign_pairs * true_sign_pairs[None, :]).sum(
+        axis=1
+    )
+
+    ties_true = (true_sign_pairs == 0).sum()
+    ties_predicted = (predicted_sign_pairs == 0).sum(axis=1)
+
+    total_pairs = n * (n - 1) / 2
+    denominator = np.sqrt(
+        (total_pairs - ties_true) * (total_pairs - ties_predicted)
+    )
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(
+            denominator != 0, concordant_minus_discordant / denominator, np.nan
+        )
 
 
 def run_monte_carlo_trials(
@@ -93,35 +176,34 @@ def run_monte_carlo_trials(
     k: int,
     aggregator_name: str,
     n_trials: int,
-    rng: random.Random,
-) -> tuple[list[float], list[float]]:
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
     """Run n_trials joint resampling trials at a given k.
 
-    Each trial independently draws k samples per kernel (see draw_k_samples),
-    aggregates them into one predicted latency per kernel, and computes
-    Spearman rho and Kendall tau between the resulting predicted-latency
-    ranking and the gold ranking. Both statistics are computed from the same
-    draws so they share one Monte Carlo sampling loop.
+    Each trial independently draws k samples per kernel (see
+    draw_k_samples_batch), aggregates them into one predicted latency per
+    kernel, and computes Spearman rho and Kendall tau between the resulting
+    predicted-latency ranking and the gold ranking. All trials are computed
+    together as vectorized numpy operations instead of a per-trial Python
+    loop calling scipy.stats.
 
-    Returns (rho_trials, tau_trials): the per-trial statistic values, from
+    Returns (rho_trials, tau_trials): the per-trial statistic arrays, from
     which the mean (rho@k / tau@k) and standard error can be computed.
     """
-    aggregate = AGGREGATORS[aggregator_name]
-    true_values = [true_latency for _, true_latency, _ in kernels]
+    true_values = np.asarray([true_latency for _, true_latency, _ in kernels])
 
-    rho_trials = []
-    tau_trials = []
-
-    for _ in range(n_trials):
-        predicted_values = [
-            aggregate(draw_k_samples(estimates, k, rng))
+    predicted_batch = np.stack(
+        [
+            aggregate_batch(
+                draw_k_samples_batch(estimates, k, n_trials, rng), aggregator_name
+            )
             for _, _, estimates in kernels
-        ]
+        ],
+        axis=1,
+    )
 
-        rho, _ = spearmanr(true_values, predicted_values)
-        tau, _ = kendalltau(true_values, predicted_values)
-        rho_trials.append(rho)
-        tau_trials.append(tau)
+    rho_trials = spearman_rho_batch(true_values, predicted_batch)
+    tau_trials = kendall_tau_b_batch(true_values, predicted_batch)
 
     return rho_trials, tau_trials
 
@@ -138,17 +220,17 @@ def compute_stat_at_k(
     kernel. Returns {k: {"rho": (mean, se), "tau": (mean, se)}}.
     """
     max_n = max(len(estimates) for _, _, estimates in kernels)
-    rng = random.Random(seed)
+    rng = np.random.default_rng(seed)
 
     results = {}
     for k in range(1, max_n + 1):
         rho_trials, tau_trials = run_monte_carlo_trials(
             kernels, k, aggregator_name, n_trials, rng
         )
-        rho_mean = statistics.mean(rho_trials)
-        rho_se = statistics.pstdev(rho_trials) / (n_trials**0.5)
-        tau_mean = statistics.mean(tau_trials)
-        tau_se = statistics.pstdev(tau_trials) / (n_trials**0.5)
+        rho_mean = float(np.nanmean(rho_trials))
+        rho_se = float(np.nanstd(rho_trials) / (n_trials**0.5))
+        tau_mean = float(np.nanmean(tau_trials))
+        tau_se = float(np.nanstd(tau_trials) / (n_trials**0.5))
         results[k] = {
             "rho": (rho_mean, rho_se),
             "tau": (tau_mean, tau_se),
@@ -197,8 +279,14 @@ def plot_stat_at_k(
             label=model_name,
         )
 
-    axis.set_xticks(sorted(all_k_values))
-    axis.set_xlim(min(all_k_values), max(all_k_values))
+    sorted_k_values = sorted(all_k_values)
+    axis.set_xscale("log")
+    axis.set_xlim(min(sorted_k_values), max(sorted_k_values))
+    axis.xaxis.set_major_locator(FixedLocator(sorted_k_values))
+    axis.xaxis.set_major_formatter(ScalarFormatter())
+    axis.xaxis.set_minor_locator(LogLocator(base=10, subs="all"))
+    axis.xaxis.set_minor_formatter(NullFormatter())
+    axis.set_ylim(0.0, 1.0)
     figure.suptitle(
         f"HLS Kernel Ranking {stat_label}@k ({aggregator})", fontsize=13, y=0.99
     )
@@ -277,16 +365,12 @@ def main() -> None:
             print(f"Skipping {model_name}: no valid model results")
             continue
 
-        stat_at_k = compute_stat_at_k(
-            kernels, args.aggregator, args.trials, args.seed
-        )
+        stat_at_k = compute_stat_at_k(kernels, args.aggregator, args.trials, args.seed)
         stat_at_k_by_model[model_name] = stat_at_k
         for k in sorted(stat_at_k):
             rho_mean, _ = stat_at_k[k]["rho"]
             tau_mean, _ = stat_at_k[k]["tau"]
-            print(
-                f"{model_name} k={k}: rho@k={rho_mean:.4f} tau@k={tau_mean:.4f}"
-            )
+            print(f"{model_name} k={k}: rho@k={rho_mean:.4f} tau@k={tau_mean:.4f}")
 
     if not stat_at_k_by_model:
         return
